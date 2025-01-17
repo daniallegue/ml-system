@@ -6,6 +6,8 @@ import requests
 from kafka import KafkaProducer
 from prefect import flow, task
 
+from store_to_bigquery import insert_into_bigquery
+
 @task
 def fetch_stock_data(symbol : str, api_key : str) -> dict:
     """
@@ -23,7 +25,12 @@ def fetch_stock_data(symbol : str, api_key : str) -> dict:
 
     res = requests.get(url)
     res.raise_for_status() # Might raise error
+
     data = res.json()
+
+    if res.status_code != 200:
+        print(f"Error: Received HTTP {res.status_code}")
+        return {"Error": f"HTTP {res.status_code}"}
 
     return data
 
@@ -33,6 +40,10 @@ def send_data_to_kafka(data : dict, topic : str, bootstrap_servers : str = "loca
     Sends data to a specified Kafka topic
     """
 
+    if "Error" in data:
+        print("Skipping Kafka message. API returned an error.")
+        return
+
     producer = KafkaProducer(
         bootstrap_servers = [bootstrap_servers],
         value_serializer = lambda v : str(v).encode('utf-8')
@@ -41,6 +52,8 @@ def send_data_to_kafka(data : dict, topic : str, bootstrap_servers : str = "loca
     producer.send(topic, value = data)
     producer.flush()
     producer.close()
+
+    print(f"Data sent to Kafka topic '{topic}'.")
 
 
 @flow
@@ -52,8 +65,9 @@ def ingest_data_full_flow():
     api_key = os.getenv("ALPHAVANTAGE_API_KEY", "DEFAULT_KEY")
     print(api_key)
 
-    #if api_key == "DEFAULT_KEY":
-    # TODO: error handling
+    if api_key == "DEFAULT_KEY":
+        print("Invalid API-key")
+        return
 
     symbol = "AAPL"
     topic = f"{symbol}_stock_price"
@@ -61,6 +75,8 @@ def ingest_data_full_flow():
     stock_data = fetch_stock_data(symbol, topic)
 
     send_data_to_kafka(stock_data, topic)
+
+    insert_into_bigquery(stock_data)
 
     print(f"Data for {symbol} sent to Kafka topic '{topic}'.")
 
