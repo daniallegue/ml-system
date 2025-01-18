@@ -7,6 +7,7 @@ from kafka import KafkaProducer
 from prefect import flow, task
 
 from store_to_bigquery import insert_into_bigquery
+from feature_engineering import engineer_features
 
 @task
 def fetch_stock_data(symbol : str, api_key : str) -> dict:
@@ -78,13 +79,16 @@ def ingest_data_full_flow():
 
     insert_into_bigquery(stock_data)
 
+    # Engineer features
+    engineer_features(stock_data, symbol)
+
     print(f"Data for {symbol} sent to Kafka topic '{topic}'.")
 
 
 if __name__ == "__main__":
     while True:
-        # Fetch data every minute
+        # Fetch data every 15 seconds
         ingest_data_full_flow()
-        time.sleep(60)
+        time.sleep(15)
 
 
