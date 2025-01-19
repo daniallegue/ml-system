@@ -1,7 +1,4 @@
-""" Script to train model """
-
 # my_continual_learning_project/orchestrator/train_model.py
-
 import os
 import numpy as np
 import torch
@@ -9,9 +6,20 @@ import torch.nn as nn
 import torch.optim as optim
 from dotenv import load_dotenv
 from sklearn.metrics import mean_squared_error
-from model import LSTMTimeSeries
+from model import LSTMTimeSeries, GRUTimeSeries, FeedforwardTimeSeries
 from data_pipeline import prepare_dataloaders
+from multi_armed_bandit import MultiArmedBandit
 from prefect import task, flow
+import logging
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,  # Set to DEBUG for more verbose output
+    format='%(asctime)s %(levelname)s:%(message)s',
+    handlers=[
+        logging.StreamHandler()
+    ]
+)
 
 load_dotenv()
 
@@ -26,123 +34,168 @@ LEARNING_RATE = 0.001
 HIDDEN_SIZE = 64
 NUM_LAYERS = 2
 OUTPUT_SIZE = PRED_LENGTH
-MODEL_PATH = f"models/{SYMBOL}_lstm.pth"
-SCALER_PATH = f"models/{SYMBOL}_scaler.pkl"
+MODEL_PATH = f"models/files/{SYMBOL}_best_model.pth"
+BEST_MODEL_NAME_PATH = f"models/files/{SYMBOL}_best_model.txt"
+SCALER_PATH = f"models/files/{SYMBOL}_scaler.pkl"
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
+logging.info(f"Using device: {device}")
 
 @task
 def train_model():
     """
-    Trains the LSTM model on the prepared data.
+    Trains multiple models using the Multi-Armed Bandit algorithm.
     """
-    print("Preparing DataLoaders...")
+    logging.info("Preparing DataLoaders...")
     # Prepare DataLoaders
     try:
         train_loader, val_loader = prepare_dataloaders(SYMBOL, WINDOW, BATCH_SIZE, SEQ_LENGTH)
-        print("DataLoaders prepared successfully.")
+        logging.info("DataLoaders prepared successfully.")
     except Exception as e:
-        print(f"Error preparing DataLoaders: {e}")
+        logging.error(f"Error preparing DataLoaders: {e}")
         return
 
-    # Initialize the model
-    try:
-        input_size = train_loader.dataset.scaled_data.shape[1]
-        print(f"Input size: {input_size}")
-        model = LSTMTimeSeries(input_size, HIDDEN_SIZE, NUM_LAYERS, OUTPUT_SIZE)
-        model = model.to(device)
-        print("Model initialized successfully.")
-    except Exception as e:
-        print(f"Error initializing model: {e}")
-        return
+    # Define the models (arms)
+    input_size = train_loader.dataset.scaled_data.shape[1]  # 5
+    flattened_input_size = input_size * SEQ_LENGTH       # 5 * 50 = 250
+    MODELS = {
+        'LSTM': LSTMTimeSeries(input_size=input_size, hidden_size=HIDDEN_SIZE, num_layers=NUM_LAYERS, output_size=OUTPUT_SIZE),
+        'GRU': GRUTimeSeries(input_size=input_size, hidden_size=HIDDEN_SIZE, num_layers=NUM_LAYERS, output_size=OUTPUT_SIZE),
+        'Feedforward': FeedforwardTimeSeries(input_size=flattened_input_size, hidden_size=HIDDEN_SIZE, num_layers=NUM_LAYERS, output_size=OUTPUT_SIZE)
+    }
 
-    # Define Loss and Optimizer
-    try:
-        criterion = nn.MSELoss()
-        optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
-        print("Loss function and optimizer defined.")
-    except Exception as e:
-        print(f"Error defining loss/optimizer: {e}")
-        return
+    # Initialize the Multi-Armed Bandit
+    bandit = MultiArmedBandit(n_arms=len(MODELS))
+    arm_names = list(MODELS.keys())
 
-    # Training Loop
-    print("Starting training...")
+    # Move all models to device
+    for name, model in MODELS.items():
+        model.to(device)
+        logging.info(f"Model '{name}' initialized and moved to device.")
+
+    # Define Loss and Optimizer for each model
+    criteria = {name: nn.MSELoss() for name in arm_names}
+    optimizers = {name: optim.Adam(model.parameters(), lr=LEARNING_RATE) for name, model in MODELS.items()}
+
+    # Initialize metrics tracking
+    metrics = {name: [] for name in arm_names}
+
+    # Training Loop with MAB
+    logging.info("Starting training with Multi-Armed Bandit...")
     for epoch in range(1, EPOCHS + 1):
-        model.train()
-        epoch_losses = []
+        bandit_losses = {name: [] for name in arm_names}
+
         for batch_idx, (X, y) in enumerate(train_loader):
+            # Select a model based on MAB
+            chosen_arm = bandit.select_arm()
+            chosen_model_name = arm_names[chosen_arm]
+            chosen_model = MODELS[chosen_model_name]
+            chosen_optimizer = optimizers[chosen_model_name]
+            chosen_criterion = criteria[chosen_model_name]
+
+            X = X.to(device)
+            y = y.to(device)
+
             try:
-                X = X.to(device)
-                y = y.to(device)
-
-                optimizer.zero_grad()
-                outputs = model(X)
-                loss = criterion(outputs, y)
+                chosen_optimizer.zero_grad()
+                outputs = chosen_model(X)
+                loss = chosen_criterion(outputs, y)
                 loss.backward()
-                optimizer.step()
+                chosen_optimizer.step()
 
-                epoch_losses.append(loss.item())
+                bandit_losses[chosen_model_name].append(loss.item())
             except Exception as e:
-                print(f"Error during training at batch {batch_idx}: {e}")
+                logging.error(f"Error during training at batch {batch_idx} with model '{chosen_model_name}': {e}")
                 continue
 
-        avg_train_loss = sum(epoch_losses) / len(epoch_losses) if epoch_losses else float('inf')
+        # Calculate average losses per model for this epoch
+        avg_losses = {}
+        for name, losses in bandit_losses.items():
+            avg_losses[name] = np.mean(losses) if losses else float('inf')
 
-        # Validation
-        model.eval()
-        val_losses = []
-        with torch.no_grad():
-            for val_idx, (X_val, y_val) in enumerate(val_loader):
-                try:
-                    X_val = X_val.to(device)
-                    y_val = y_val.to(device)
+        # Select the best model based on average loss
+        best_model_name = min(avg_losses, key=avg_losses.get)
+        best_loss = avg_losses[best_model_name]
 
-                    outputs = model(X_val)
-                    loss = criterion(outputs, y_val)
-                    val_losses.append(loss.item())
-                except Exception as e:
-                    print(f"Error during validation at batch {val_idx}: {e}")
-                    continue
+        # Reward: inverse of loss (higher is better)
+        reward = 1 / best_loss if best_loss != 0 else 0
 
-        avg_val_loss = sum(val_losses) / len(val_losses) if val_losses else float('inf')
+        # Update the bandit with the reward for the best arm
+        best_arm = arm_names.index(best_model_name)
+        bandit.update(best_arm, reward)
 
-        print(f"Epoch [{epoch}/{EPOCHS}] - Train Loss: {avg_train_loss:.4f} - Val Loss: {avg_val_loss:.4f}")
+        # Log metrics
+        metrics[best_model_name].append(best_loss)
 
-        try:
-            os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
-            torch.save(model.state_dict(), MODEL_PATH)
-            print(f"Model saved to {MODEL_PATH}")
-        except Exception as e:
-            print(f"Error saving model: {e}")
+        logging.info(f"Epoch [{epoch}/{EPOCHS}] - Selected Model: '{best_model_name}' - Avg Train Loss: {best_loss:.4f}")
+
+    # After training, select the best model based on MAB estimates
+    final_estimates = bandit.get_estimates()
+    best_arm_final = np.argmax(final_estimates)
+    best_model_final_name = arm_names[best_arm_final]
+    best_model_final = MODELS[best_model_final_name]
+    logging.info(f"Best model selected: '{best_model_final_name}' with estimated success probability: {final_estimates[best_arm_final]:.4f}")
+
+    # Save the best model's state_dict
+    try:
+        os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
+        torch.save(best_model_final.state_dict(), MODEL_PATH)
+        logging.info(f"Model saved to '{MODEL_PATH}'")
+    except Exception as e:
+        logging.error(f"Error saving model: {e}")
+
+    # Save the best model's name for evaluation
+    try:
+        with open(BEST_MODEL_NAME_PATH, "w") as f:
+            f.write(best_model_final_name)
+        logging.info(f"Best model name saved to '{BEST_MODEL_NAME_PATH}'")
+    except Exception as e:
+        logging.error(f"Error saving best model name: {e}")
 
 @task
 def evaluate_model():
     """
     Evaluates the trained model on validation data.
     """
-    print("Evaluating the model...")
+    logging.info("Evaluating the model...")
     # Prepare DataLoaders
     try:
         _, val_loader = prepare_dataloaders(SYMBOL, WINDOW, BATCH_SIZE, SEQ_LENGTH)
-        print("Validation DataLoader prepared.")
+        logging.info("Validation DataLoader prepared.")
     except Exception as e:
-        print(f"Error preparing Validation DataLoader: {e}")
+        logging.error(f"Error preparing Validation DataLoader: {e}")
         return float('inf')
 
-    # Initialize the model
+    # Read the best model's name
+    BEST_MODEL_NAME_PATH = f"models/files/{SYMBOL}_best_model.txt"
+    try:
+        with open(BEST_MODEL_NAME_PATH, "r") as f:
+            best_model_name = f.read().strip()
+        logging.info(f"Best model name retrieved: '{best_model_name}'")
+    except Exception as e:
+        logging.error(f"Error reading best model name: {e}")
+        return float('inf')
+
+    # Initialize the appropriate model
     try:
         input_size = val_loader.dataset.scaled_data.shape[1]
-        print(f"Input size for evaluation: {input_size}")
-        model = LSTMTimeSeries(input_size, HIDDEN_SIZE, NUM_LAYERS, OUTPUT_SIZE)
-        model_path = f"models/{SYMBOL}_lstm.pth"
-        # Set weights_only=True to address FutureWarning
-        model.load_state_dict(torch.load(model_path, weights_only=True))
+        flattened_input_size = input_size * SEQ_LENGTH
+        if best_model_name == 'LSTM':
+            model = LSTMTimeSeries(input_size=input_size, hidden_size=HIDDEN_SIZE, num_layers=NUM_LAYERS, output_size=OUTPUT_SIZE)
+        elif best_model_name == 'GRU':
+            model = GRUTimeSeries(input_size=input_size, hidden_size=HIDDEN_SIZE, num_layers=NUM_LAYERS, output_size=OUTPUT_SIZE)
+        elif best_model_name == 'Feedforward':
+            model = FeedforwardTimeSeries(input_size=flattened_input_size, hidden_size=HIDDEN_SIZE, num_layers=NUM_LAYERS, output_size=OUTPUT_SIZE)
+        else:
+            raise ValueError(f"Unknown model name: {best_model_name}")
+
+        model_path = f"models/files/{SYMBOL}_best_model.pth"
+        model.load_state_dict(torch.load(model_path, map_location=device))
         model = model.to(device)
         model.eval()
-        print("Model loaded successfully for evaluation.")
+        logging.info(f"Model '{best_model_name}' loaded successfully for evaluation.")
     except Exception as e:
-        print(f"Error loading model for evaluation: {e}")
+        logging.error(f"Error loading model for evaluation: {e}")
         return float('inf')
 
     all_preds = []
@@ -158,11 +211,11 @@ def evaluate_model():
                 all_preds.append(outputs.cpu().numpy())
                 all_targets.append(y_val.cpu().numpy())
             except Exception as e:
-                print(f"Error during evaluation at batch {val_idx}: {e}")
+                logging.error(f"Error during evaluation at batch {val_idx}: {e}")
                 continue
 
     if not all_preds or not all_targets:
-        print("No predictions or targets available for evaluation.")
+        logging.warning("No predictions or targets available for evaluation.")
         return float('inf')
 
     all_preds = np.concatenate(all_preds)
@@ -171,22 +224,22 @@ def evaluate_model():
     try:
         mse = mean_squared_error(all_targets, all_preds)
         rmse = np.sqrt(mse)
-        print(f"Validation RMSE: {rmse:.4f}")
+        logging.info(f"Validation RMSE: {rmse:.4f}")
         return rmse
     except Exception as e:
-        print(f"Error calculating RMSE: {e}")
+        logging.error(f"Error calculating RMSE: {e}")
         return float('inf')
 
 @flow
 def model_training_flow():
     """
-    Prefect flow that handles model training and evaluation.
+    Prefect flow that handles model training and evaluation using Multi-Armed Bandit.
     """
     train_model()
     rmse = evaluate_model()
 
     # TODO: Monitor this value and store it in BigQuery -> Trigger retraining
-    print(f"Training completed with Validation RMSE: {rmse:.4f}")
+    logging.info(f"Training completed with Validation RMSE: {rmse:.4f}")
 
 if __name__ == "__main__":
     model_training_flow()
